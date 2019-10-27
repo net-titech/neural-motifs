@@ -1,6 +1,14 @@
 """
 File that involves dataloaders for the Visual Genome dataset.
 """
+from config import VG_IMAGES, IM_DATA_FN, VG_SGG_FN, VG_SGG_DICT_FN, BOX_SCALE, IM_SCALE, PROPOSAL_FN
+from config import stanford_path
+from pathlib import Path
+from ast import literal_eval
+import json
+
+LOAD_IMAGE = True
+ZSL_SPLIT_FN = stanford_path('zsl_split.dict')
 
 import json
 import os
@@ -8,23 +16,27 @@ import os
 import h5py
 import numpy as np
 import torch
-from PIL import Image
 from torch.utils.data import Dataset
-from torchvision.transforms import Resize, Compose, ToTensor, Normalize
-from dataloaders.blob import Blob
 from lib.fpn.box_intersections_cpu.bbox import bbox_overlaps
-from config import VG_IMAGES, IM_DATA_FN, VG_SGG_FN, VG_SGG_DICT_FN, BOX_SCALE, IM_SCALE, PROPOSAL_FN
-from dataloaders.image_transforms import SquarePad, Grayscale, Brightness, Sharpness, Contrast, \
-    RandomOrder, Hue, random_crop
+
 from collections import defaultdict
 from pycocotools.coco import COCO
 
+if LOAD_IMAGE:
+    from PIL import Image
+    from torchvision.transforms import Resize, Compose, ToTensor, Normalize
+    from dataloaders.blob import Blob
+    from dataloaders.image_transforms import SquarePad, Grayscale, Brightness, Sharpness, Contrast, \
+        RandomOrder, Hue, random_crop
 
 class VG(Dataset):
+
+    splitter = None
+
     def __init__(self, mode, roidb_file=VG_SGG_FN, dict_file=VG_SGG_DICT_FN,
                  image_file=IM_DATA_FN, filter_empty_rels=True, num_im=-1, num_val_im=5000,
                  filter_duplicate_rels=True, filter_non_overlap=True,
-                 use_proposals=False):
+                 use_proposals=False, split_mask=None):
         """
         Torch dataset for VisualGenome
         :param mode: Must be train, test, or val
@@ -55,6 +67,7 @@ class VG(Dataset):
             self.roidb_file, self.mode, num_im, num_val_im=num_val_im,
             filter_empty_rels=filter_empty_rels,
             filter_non_overlap=self.filter_non_overlap and self.is_train,
+            split_mask=split_mask
         )
 
         self.filenames = load_image_filenames(image_file)
@@ -91,13 +104,14 @@ class VG(Dataset):
         #         Hue(),
         #     ]))
 
-        tform = [
-            SquarePad(),
-            Resize(IM_SCALE),
-            ToTensor(),
-            Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ]
-        self.transform_pipeline = Compose(tform)
+        if LOAD_IMAGE:
+            tform = [
+                SquarePad(),
+                Resize(IM_SCALE),
+                ToTensor(),
+                Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ]
+            self.transform_pipeline = Compose(tform)
 
     @property
     def coco(self):
@@ -138,40 +152,63 @@ class VG(Dataset):
         test = cls('test', *args, **kwargs)
         return train, val, test
 
+    @classmethod
+    def splits_zsl_detector(cls, set_num, n_test=10, n_fold=5, n_val=10, *args, **kwargs):
+        if cls.splitter is None:
+            cls.splitter = SplitZSL(n_test=n_test, n_fold=n_fold, n_val=n_val)
+        train_mask = cls.splitter.get_train_mask(set_num)
+        train = cls(mode='train', split_mask=train_mask, *args, **kwargs)
+        val = cls(mode='val', split_mask=train_mask, *args, **kwargs)
+        test = cls(mode='test', split_mask=train_mask, *args, **kwargs)
+        return train, val, test
+
+    @classmethod
+    def splits_zsl_learner(cls, set_num, n_test=10, n_fold=5, n_val=10, *args, **kwargs):
+        if cls.splitter is None:
+            cls.splitter = SplitZSL(n_test=n_test, n_fold=n_fold, n_val=n_val)
+        train_mask = cls.splitter.get_train_mask(set_num)
+        train = cls(mode='test', split_mask=train_mask, num_val_im=0, *args, **kwargs)
+        val_mask = cls.splitter.get_val_mask(set_num)
+        val = cls(mode='test', split_mask=val_mask, num_val_im=0, *args, **kwargs)
+        test_mask = cls.splitter.get_test_mask(set_num)
+        test = cls(mode='test', split_mask=test_mask, num_val_im=0, *args, **kwargs)
+        return train, val, test
+
     def __getitem__(self, index):
-        image_unpadded = Image.open(self.filenames[index]).convert('RGB')
 
-        # Optionally flip the image if we're doing training
-        flipped = self.is_train and np.random.random() > 0.5
-        gt_boxes = self.gt_boxes[index].copy()
+        if LOAD_IMAGE:
+            image_unpadded = Image.open(self.filenames[index]).convert('RGB')
+            
+            # Optionally flip the image if we're doing training
+            gt_boxes = self.gt_boxes[index].copy()
+            flipped = self.is_train and np.random.random() > 0.5
+            # Boxes are already at BOX_SCALE
+            if self.is_train:
+                # crop boxes that are too large. This seems to be only a problem for image heights, but whatevs
+                gt_boxes[:, [1, 3]] = gt_boxes[:, [1, 3]].clip(
+                    None, BOX_SCALE / max(image_unpadded.size) * image_unpadded.size[1])
+                gt_boxes[:, [0, 2]] = gt_boxes[:, [0, 2]].clip(
+                    None, BOX_SCALE / max(image_unpadded.size) * image_unpadded.size[0])
 
-        # Boxes are already at BOX_SCALE
-        if self.is_train:
-            # crop boxes that are too large. This seems to be only a problem for image heights, but whatevs
-            gt_boxes[:, [1, 3]] = gt_boxes[:, [1, 3]].clip(
-                None, BOX_SCALE / max(image_unpadded.size) * image_unpadded.size[1])
-            gt_boxes[:, [0, 2]] = gt_boxes[:, [0, 2]].clip(
-                None, BOX_SCALE / max(image_unpadded.size) * image_unpadded.size[0])
+                # # crop the image for data augmentation
+                # image_unpadded, gt_boxes = random_crop(image_unpadded, gt_boxes, BOX_SCALE, round_boxes=True)
 
-            # # crop the image for data augmentation
-            # image_unpadded, gt_boxes = random_crop(image_unpadded, gt_boxes, BOX_SCALE, round_boxes=True)
+            w, h = image_unpadded.size
+            box_scale_factor = BOX_SCALE / max(w, h)
 
-        w, h = image_unpadded.size
-        box_scale_factor = BOX_SCALE / max(w, h)
+            if flipped:
+                scaled_w = int(box_scale_factor * float(w))
+                # print("Scaled w is {}".format(scaled_w))
+                image_unpadded = image_unpadded.transpose(Image.FLIP_LEFT_RIGHT)
+                gt_boxes[:, [0, 2]] = scaled_w - gt_boxes[:, [2, 0]]
 
-        if flipped:
-            scaled_w = int(box_scale_factor * float(w))
-            # print("Scaled w is {}".format(scaled_w))
-            image_unpadded = image_unpadded.transpose(Image.FLIP_LEFT_RIGHT)
-            gt_boxes[:, [0, 2]] = scaled_w - gt_boxes[:, [2, 0]]
-
-        img_scale_factor = IM_SCALE / max(w, h)
-        if h > w:
-            im_size = (IM_SCALE, int(w * img_scale_factor), img_scale_factor)
-        elif h < w:
-            im_size = (int(h * img_scale_factor), IM_SCALE, img_scale_factor)
-        else:
-            im_size = (IM_SCALE, IM_SCALE, img_scale_factor)
+            img_scale_factor = IM_SCALE / max(w, h)
+            if h > w:
+                im_size = (IM_SCALE, int(w * img_scale_factor), img_scale_factor)
+            elif h < w:
+                im_size = (int(h * img_scale_factor), IM_SCALE, img_scale_factor)
+            else:
+                im_size = (IM_SCALE, IM_SCALE, img_scale_factor)
 
         gt_rels = self.relationships[index].copy()
         if self.filter_duplicate_rels:
@@ -184,22 +221,36 @@ class VG(Dataset):
             gt_rels = [(k[0], k[1], np.random.choice(v)) for k,v in all_rel_sets.items()]
             gt_rels = np.array(gt_rels)
 
-        entry = {
-            'img': self.transform_pipeline(image_unpadded),
-            'img_size': im_size,
-            'gt_boxes': gt_boxes,
-            'gt_classes': self.gt_classes[index].copy(),
-            'gt_relations': gt_rels,
-            'scale': IM_SCALE / BOX_SCALE,  # Multiply the boxes by this.
-            'index': index,
-            'flipped': flipped,
-            'fn': self.filenames[index],
-        }
+        if LOAD_IMAGE:
+            entry = {
+                'img': self.transform_pipeline(image_unpadded),
+                'img_size': im_size,
+                'gt_boxes': gt_boxes,
+                'gt_classes': self.gt_classes[index].copy(),
+                'gt_relations': gt_rels,
+                'scale': IM_SCALE / BOX_SCALE,  # Multiply the boxes by this.
+                'index': index,
+                'flipped': flipped,
+                'fn': self.filenames[index],
+            }
+        else:
+            entry = {
+                'img': None,
+                'img_size': None,
+                'gt_boxes': self.gt_boxes[index].copy(),
+                'gt_classes': self.gt_classes[index].copy(),
+                'gt_relations': gt_rels,
+                'scale': IM_SCALE / BOX_SCALE,  # Multiply the boxes by this.
+                'index': index,
+                'flipped': None,
+                'fn': self.filenames[index],
+            }
 
         if self.rpn_rois is not None:
             entry['proposals'] = self.rpn_rois[index]
 
-        assertion_checks(entry)
+        if LOAD_IMAGE:
+            assertion_checks(entry)
         return entry
 
     def __len__(self):
@@ -255,14 +306,14 @@ def load_image_filenames(image_file, image_dir=VG_IMAGES):
             continue
 
         filename = os.path.join(image_dir, basename)
-        if os.path.exists(filename):
+        if not LOAD_IMAGE or os.path.exists(filename):
             fns.append(filename)
     assert len(fns) == 108073
     return fns
 
 
 def load_graphs(graphs_file, mode='train', num_im=-1, num_val_im=0, filter_empty_rels=True,
-                filter_non_overlap=False):
+                filter_non_overlap=False, split_mask=None):
     """
     Load the file containing the GT boxes and relations, as well as the dataset split
     :param graphs_file: HDF5
@@ -284,12 +335,14 @@ def load_graphs(graphs_file, mode='train', num_im=-1, num_val_im=0, filter_empty
     roi_h5 = h5py.File(graphs_file, 'r')
     data_split = roi_h5['split'][:]
     split = 2 if mode == 'test' else 0
-    split_mask = data_split == split
 
-    # Filter out images without bounding boxes
-    split_mask &= roi_h5['img_to_first_box'][:] >= 0
-    if filter_empty_rels:
-        split_mask &= roi_h5['img_to_first_rel'][:] >= 0
+    if split_mask is None:
+        split_mask = data_split == split
+
+        # Filter out images without bounding boxes
+        split_mask &= roi_h5['img_to_first_box'][:] >= 0
+        if filter_empty_rels:
+            split_mask &= roi_h5['img_to_first_rel'][:] >= 0
 
     image_index = np.where(split_mask)[0]
     if num_im > -1:
@@ -299,7 +352,6 @@ def load_graphs(graphs_file, mode='train', num_im=-1, num_val_im=0, filter_empty
             image_index = image_index[:num_val_im]
         elif mode == 'train':
             image_index = image_index[num_val_im:]
-
 
     split_mask = np.zeros_like(data_split).astype(bool)
     split_mask[image_index] = True
@@ -422,3 +474,96 @@ class VGDataLoader(torch.utils.data.DataLoader):
             **kwargs,
         )
         return train_load, val_load
+
+
+def get_max(array, k=10):
+    indexes = np.where(array > float('-inf'))
+    values = array[indexes]
+    ind = np.argpartition(values, -k)[-k:]
+    ind = ind[np.argsort(values[ind])][::-1]
+    return [index[ind] for index in indexes], values[ind]
+
+
+class SplitZSL:
+
+    def __init__(self,  load=True, *args, **kwargs):
+        global LOAD_IMAGE
+        _old_setting = LOAD_IMAGE
+        LOAD_IMAGE = False
+        split_mask_1, gt_boxes_1, gt_classes_1, relationships_1 = load_graphs(VG_SGG_FN, mode='train', filter_empty_rels=False)
+        split_mask_2, gt_boxes_2, gt_classes_2, relationships_2 = load_graphs(VG_SGG_FN, mode='test', filter_empty_rels=False)
+        # split_mask_3, gt_boxes_3, gt_classes_3, relationships_3 = load_graphs(VG_SGG_FN, mode='test')
+
+        self.split_mask = split_mask_1 | split_mask_2
+        # gt_boxes = gt_boxes_1 + gt_boxes_2 + gt_boxes_3
+        self.gt_classes = gt_classes_1 + gt_classes_2
+        self.relationships = relationships_1 + relationships_2
+
+        self.i2c, self.i2p = load_info(VG_SGG_DICT_FN)
+        filenames = load_image_filenames(IM_DATA_FN)
+        self.filenames = [filenames[i] for i in np.where(self.split_mask)[0]]
+
+        self.obj_count = np.zeros(len(self.i2c))
+        for classes in self.gt_classes:
+            self.obj_count[np.unique(classes)] += 1
+        if load and os.path.exists(ZSL_SPLIT_FN):
+            with open(ZSL_SPLIT_FN) as f:
+                self.load_dict = literal_eval(f.read())
+                for key, value in self.load_dict.items():
+                    setattr(self, key, value)
+        else:
+            self.hold_test_classes(*args, **kwargs)
+        LOAD_IMAGE = _old_setting
+
+    def hold_test_classes(self, n_test=10, n_fold=5, n_val=10):
+        test_classes_pool = range(len(self.i2c))
+        test_classes_pool = get_max(-self.obj_count, k=n_test*n_fold)[0][0]
+        # test_classes = np.random.choice(test_classes_pool, size=15, replace=False)
+        np.random.shuffle(test_classes_pool)
+        self.test_classes_list = [list(test_classes_pool[i*n_test: (i+1)*n_test]) for i in range(n_fold)]
+        self.val_classes_list = []
+        for test_classes in self.test_classes_list:
+            rand_classes = np.random.choice(list(set(test_classes_pool) - (set(test_classes))), size=n_val)
+            self.val_classes_list.append(list(rand_classes))
+        self.n_test = n_test
+        self.n_val = n_val
+        self.n_fold = n_fold
+        with open(ZSL_SPLIT_FN, 'w') as f:
+            f.write('{}'.format({
+                    'test_classes_list': self.test_classes_list,
+                    'val_classes_list': self.val_classes_list,
+                    'n_test': self.n_test,
+                    'n_fold': self.n_fold,
+                    'n_val': self.n_val
+                })
+            )
+
+    def get_mask(self, filtered_classes):
+        idx = []
+        filtered_classes = set(filtered_classes)
+        for i in range(len(self.gt_classes)):
+            classes = self.gt_classes[i]
+            if len(set(classes).intersection(filtered_classes)) == 0:
+                idx.append(i)
+        idx = np.where(self.split_mask)[0][idx]
+        mask = np.zeros_like(self.split_mask).astype(bool)
+        mask[idx] = True
+        return mask
+
+    def get_train_mask(self, num_set):
+        assert num_set < self.n_fold
+        filtered_classes = self.test_classes_list[num_set] + self.val_classes_list[num_set]
+        return self.get_mask(filtered_classes)
+
+    def get_val_mask(self, num_set):
+        assert num_set < self.n_fold
+        train_mask = self.get_train_mask(num_set)
+        filtered_classes = self.test_classes_list[num_set]
+        val_mask = self.get_mask(filtered_classes)
+        return self.split_mask & ~train_mask & val_mask
+
+    def get_test_mask(self, num_set=None):
+        assert num_set < self.n_fold
+        filtered_classes = self.test_classes_list[num_set]
+        train_val_mask = self.get_mask(filtered_classes)
+        return self.split_mask & ~train_val_mask

@@ -17,15 +17,15 @@ def stanford_path(fn):
 # =============================================================================
 # Update these with where your data is stored ~~~~~~~~~~~~~~~~~~~~~~~~~
 
-VG_IMAGES = '/home/rowan/datasets2/VG_100K_2/VG_100K'
-RCNN_CHECKPOINT_FN = path('faster_rcnn_500k.h5')
+VG_IMAGES = '/data/visual-genome/VG_100K'
+RCNN_CHECKPOINT_FN = path('/checkpoints/vg-faster-rcnn.tar')
 
-IM_DATA_FN = stanford_path('image_data.json')
-VG_SGG_FN = stanford_path('VG-SGG.h5')
-VG_SGG_DICT_FN = stanford_path('VG-SGG-dicts.json')
+IM_DATA_FN = stanford_path('/data/stanford_filtered/image_data.json')
+VG_SGG_FN = stanford_path('/data/stanford_filtered/VG-SGG.h5')
+VG_SGG_DICT_FN = stanford_path('/data/stanford_filtered/VG-SGG-dicts.json')
 PROPOSAL_FN = stanford_path('proposals.h5')
 
-COCO_PATH = '/home/rowan/datasets/mscoco'
+COCO_PATH = '/data/mscoco'
 # =============================================================================
 # =============================================================================
 

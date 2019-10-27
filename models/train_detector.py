@@ -29,7 +29,7 @@ if conf.coco:
                                                      num_workers=conf.num_workers,
                                                      num_gpus=conf.num_gpus)
 else:
-    train, val, _ = VG.splits(num_val_im=conf.val_size, filter_non_overlap=False,
+    train, val, _ = VG.splits_zsl_detector(set_num=0, num_val_im=conf.val_size, filter_non_overlap=False,
                               filter_empty_rels=False, use_proposals=conf.use_proposals)
     train_loader, val_loader = VGDataLoader.splits(train, val, batch_size=conf.batch_size,
                                                    num_workers=conf.num_workers,
